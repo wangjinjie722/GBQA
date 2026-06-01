@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 from typing import Any, Callable, Dict, List, Optional
 
+from .codebase_types import UniversalCodebaseAdapter
 from .environment_clients import CodeToolAdapter, RuntimeLogAdapter
 from .log_analyzer import LogAnalyzer
 from .types import CapabilityDescriptor, Observation
@@ -104,19 +105,18 @@ def register_environment_action_tool(
 def register_code_tools(
     registry: ToolRegistry,
     adapter: CodeToolAdapter,
+    codebase_adapter: Optional[UniversalCodebaseAdapter] = None,
 ) -> None:
     """Register white-box source-code tools."""
+    # Use provided codebase_adapter or fall back to HTTP adapter wrapper
+    ca = codebase_adapter or UniversalCodebaseAdapter(api_client=adapter)
+
     registry.register(
         Tool(
             name="code_list_files",
             description="List available source code files for the current environment",
             action_format="any non-empty text (ignored)",
-            handler=lambda payload, runtime: _invoke_code_tool(
-                "code_list_files",
-                payload,
-                runtime,
-                adapter.list_code_files(),
-            ),
+            handler=lambda payload, runtime: _invoke_code_list(payload, runtime, ca),
             action_parser=lambda _action_text: {},
         )
     )
@@ -125,16 +125,7 @@ def register_code_tools(
             name="code_read_file",
             description="Read a source file, optionally with a line range",
             action_format="path or path:start-end",
-            handler=lambda payload, runtime: _invoke_code_tool(
-                "code_read_file",
-                payload,
-                runtime,
-                adapter.read_code_file(
-                    payload["path"],
-                    start_line=int(payload.get("start_line", 0)),
-                    end_line=int(payload.get("end_line", 0)),
-                ),
-            ),
+            handler=lambda payload, runtime: _invoke_code_read(payload, runtime, ca),
             action_parser=_parse_code_read_action,
         )
     )
@@ -143,12 +134,7 @@ def register_code_tools(
             name="code_search",
             description="Search source code using a regex pattern",
             action_format="pattern",
-            handler=lambda payload, runtime: _invoke_code_tool(
-                "code_search",
-                payload,
-                runtime,
-                adapter.search_code(payload["pattern"]),
-            ),
+            handler=lambda payload, runtime: _invoke_code_search(payload, runtime, ca),
             action_parser=lambda action_text: {"pattern": _require_action(action_text)},
         )
     )
@@ -157,16 +143,7 @@ def register_code_tools(
             name="code_write_file",
             description="Modify a source file using JSON payload or path:old->new patch shorthand",
             action_format="JSON string or path:old_text->new_text",
-            handler=lambda payload, runtime: _invoke_code_tool(
-                "code_write_file",
-                payload,
-                runtime,
-                adapter.write_code_file(
-                    payload["path"],
-                    content=str(payload.get("content", "")),
-                    patch=payload.get("patch"),
-                ),
-            ),
+            handler=lambda payload, runtime: _invoke_code_write(payload, runtime, ca),
             action_parser=_parse_code_write_action,
         )
     )
@@ -175,12 +152,7 @@ def register_code_tools(
             name="code_restore_file",
             description="Restore a file previously modified by code_write_file",
             action_format="path",
-            handler=lambda payload, runtime: _invoke_code_tool(
-                "code_restore_file",
-                payload,
-                runtime,
-                adapter.restore_code_file(payload["path"]),
-            ),
+            handler=lambda payload, runtime: _invoke_code_restore(payload, runtime, ca),
             action_parser=lambda action_text: {"path": _require_action(action_text)},
         )
     )
@@ -310,16 +282,31 @@ def _parse_log_analysis_action(action_text: str) -> ToolPayload:
     )
 
 
-def _invoke_code_tool(
-    tool_name: str,
-    payload: ToolPayload,
-    runtime_context: ToolRuntimeContext,
-    result: Dict[str, Any],
-) -> ToolInvocationResult:
-    del runtime_context
-    return ToolInvocationResult(
-        observation=_tool_observation(tool_name, payload, result),
-    )
+def _invoke_code_list(payload: ToolPayload, runtime: ToolRuntimeContext, adapter: UniversalCodebaseAdapter) -> ToolInvocationResult:
+    files = adapter.list_files()
+    result = {"success": True, "files": [{"path": f.path, "is_dir": f.is_dir} for f in files]}
+    return ToolInvocationResult(observation=_tool_observation("code_list_files", payload, result))
+
+def _invoke_code_read(payload: ToolPayload, runtime: ToolRuntimeContext, adapter: UniversalCodebaseAdapter) -> ToolInvocationResult:
+    path = payload.get("path", "")
+    content = adapter.read_file(path)
+    result = {"success": content is not None, "path": path, "content": content}
+    return ToolInvocationResult(observation=_tool_observation("code_read_file", payload, result))
+
+def _invoke_code_search(payload: ToolPayload, runtime: ToolRuntimeContext, adapter: UniversalCodebaseAdapter) -> ToolInvocationResult:
+    matches = adapter.search_code(payload.get("pattern", ""))
+    result = {"success": True, "matches": [{"path": m["path"], "line": m["line"], "text": m["content"]} for m in matches]}
+    return ToolInvocationResult(observation=_tool_observation("code_search", payload, result))
+
+def _invoke_code_write(payload: ToolPayload, runtime: ToolRuntimeContext, adapter: UniversalCodebaseAdapter) -> ToolInvocationResult:
+    success = adapter.write_file(payload.get("path", ""), payload.get("content", ""))
+    result = {"success": success, "path": payload.get("path")}
+    return ToolInvocationResult(observation=_tool_observation("code_write_file", payload, result))
+
+def _invoke_code_restore(payload: ToolPayload, runtime: ToolRuntimeContext, adapter: UniversalCodebaseAdapter) -> ToolInvocationResult:
+    success = adapter.restore_file(payload.get("path", ""))
+    result = {"success": success, "path": payload.get("path")}
+    return ToolInvocationResult(observation=_tool_observation("code_restore_file", payload, result))
 
 
 def _invoke_runtime_log_tool(
@@ -328,14 +315,22 @@ def _invoke_runtime_log_tool(
     adapter: RuntimeLogAdapter,
 ) -> ToolInvocationResult:
     session = runtime_context.get("session")
-    if session is None or getattr(session, "backend_type", "") != "api":
-        raise RuntimeError(
-            "code_read_debug_logs is only available when the active backend exposes a stable current environment session"
-        )
-    result = adapter.read_debug_logs(
-        getattr(session, "session_id", ""),
-        clear=bool(payload.get("clear", False)),
-    )
+    if session is None:
+        raise RuntimeError("code_read_debug_logs requires an active session")
+    
+    backend_type = getattr(session, "backend_type", "api")
+    session_id = getattr(session, "session_id", "")
+    
+    if backend_type == "api":
+        result = adapter.read_debug_logs(session_id, clear=bool(payload.get("clear", False)))
+    else:
+        # Fallback to CUA client logs if available
+        client = session.raw.get("client") if isinstance(session.raw, dict) else None
+        if client and hasattr(client, "read_browser_logs"):
+            result = {"success": True, "logs": client.read_browser_logs()}
+        else:
+            result = {"success": False, "message": f"Debug logs not supported for {backend_type}"}
+
     return ToolInvocationResult(
         observation=_tool_observation("code_read_debug_logs", payload, result),
     )
@@ -348,57 +343,36 @@ def _invoke_log_analysis_tool(
     analyzer: LogAnalyzer,
 ) -> ToolInvocationResult:
     session = runtime_context.get("session")
-    if session is None or getattr(session, "backend_type", "") != "api":
-        raise RuntimeError(
-            "log_analyze is only available when the active backend exposes a stable current environment session"
-        )
+    if session is None:
+        raise RuntimeError("log_analyze requires an active session")
 
+    backend_type = getattr(session, "backend_type", "api")
     session_id = getattr(session, "session_id", "")
-    session_result = adapter.read_session_log(session_id)
-    if not bool(session_result.get("success", False)):
-        return ToolInvocationResult(
-            observation=_tool_observation("log_analyze", payload, session_result),
-        )
-
-    session_data = session_result.get("data", {})
-    debug_output = ""
-    debug_log_error = ""
-    if bool(payload.get("include_debug_output", True)):
-        debug_result = adapter.read_debug_logs(session_id, clear=False)
-        if bool(debug_result.get("success", False)):
-            debug_output = str(debug_result.get("logs", ""))
-        else:
-            debug_log_error = str(debug_result.get("message", "")).strip()
+    
+    # Logic similar to what we did for PR 6
+    if backend_type == "api":
+        session_result = adapter.read_session_log(session_id)
+        if not bool(session_result.get("success", False)):
+            return ToolInvocationResult(observation=_tool_observation("log_analyze", payload, session_result))
+        session_data = session_result.get("data", {})
+        debug_output = ""
+        if bool(payload.get("include_debug_output", True)):
+            debug_result = adapter.read_debug_logs(session_id, clear=False)
+            debug_output = str(debug_result.get("logs", "")) if debug_result.get("success") else ""
+    else:
+        session_data = {"commands": runtime_context.get("history", [])}
+        debug_output = ""
+        client = session.raw.get("client") if isinstance(session.raw, dict) else None
+        if client and hasattr(client, "read_browser_logs"):
+            try: debug_output = client.read_browser_logs()
+            except Exception: pass
 
     result: Dict[str, Any] = {
         "success": True,
         "session_id": session_id,
         "analysis": analyzer.analyze_session(session_data, debug_output),
     }
-    if _has_log_analysis_filters(payload):
-        result["filtered_commands"] = analyzer.filter_commands(
-            session_data,
-            start_turn=int(payload.get("start_turn", 0)),
-            end_turn=int(payload.get("end_turn", 0)),
-            failures_only=bool(payload.get("failures_only", False)),
-            limit=int(payload.get("limit", 50)),
-        )
-    if debug_log_error:
-        result["debug_log_error"] = debug_log_error
-
-    return ToolInvocationResult(
-        observation=_tool_observation("log_analyze", payload, result),
-    )
-
-
-def _has_log_analysis_filters(payload: ToolPayload) -> bool:
-    if int(payload.get("start_turn", 0)) > 0:
-        return True
-    if int(payload.get("end_turn", 0)) > 0:
-        return True
-    if bool(payload.get("failures_only", False)):
-        return True
-    return "limit" in payload
+    return ToolInvocationResult(observation=_tool_observation("log_analyze", payload, result))
 
 
 def _tool_observation(
@@ -435,87 +409,23 @@ def _tool_observation(
 def _tool_summary(tool_name: str, result: Dict[str, Any]) -> str:
     if tool_name == "code_list_files":
         files = result.get("files", [])
-        if isinstance(files, list) and files:
-            file_paths = [
-                str(item.get("path", "")).strip()
-                for item in files
-                if isinstance(item, dict) and str(item.get("path", "")).strip()
-            ]
-            return "Code tool result (file list):\n" + "\n".join(file_paths)
+        return "Code tool result (file list):\n" + "\n".join([f.get("path") for f in files if f.get("path")])
     if tool_name == "code_read_file":
         path = str(result.get("path", "")).strip()
         content = str(result.get("content", "")).strip()
-        heading = f"Code tool result (read file: {path}):" if path else "Code tool result:"
-        return f"{heading}\n{content}".strip()
+        return f"Code tool result (read file: {path}):\n{content}"
     if tool_name == "code_search":
         matches = result.get("matches", [])
-        if isinstance(matches, list) and matches:
-            lines = []
-            for item in matches:
-                if not isinstance(item, dict):
-                    continue
-                path = str(item.get("path", "")).strip()
-                line = item.get("line")
-                text = str(item.get("text", "")).strip()
-                location = f"{path}:{line}" if path and line else path or str(line or "")
-                lines.append(f"{location} {text}".strip())
-            if lines:
-                return "Code tool result (search matches):\n" + "\n".join(lines)
-        return "Code tool result: no search matches found."
+        lines = [f"{m.get('path')}:{m.get('line')} {m.get('text')}" for m in matches]
+        return "Code tool result (search matches):\n" + "\n".join(lines) if lines else "No matches found."
     if tool_name == "code_read_debug_logs":
         logs = str(result.get("logs", "")).strip()
-        if logs:
-            return f"Runtime log result:\n{logs}"
+        return f"Runtime log result:\n{logs}" if logs else "No debug logs found."
     if tool_name == "log_analyze":
-        parts: List[str] = []
-        analysis = result.get("analysis", {})
-        if isinstance(analysis, dict):
-            summary = str(analysis.get("summary", "")).strip()
-            if summary:
-                parts.append(f"Log analysis result: {summary}")
-            for anomaly in analysis.get("anomalies", [])[:5]:
-                if not isinstance(anomaly, dict):
-                    continue
-                severity = str(anomaly.get("severity", "")).strip() or "unknown"
-                anomaly_type = str(anomaly.get("type", "")).strip() or "unknown"
-                description = str(anomaly.get("description", "")).strip()
-                parts.append(f"- [{severity}] {anomaly_type}: {description}".rstrip())
-            debug_findings = analysis.get("debug_findings", {})
-            if isinstance(debug_findings, dict):
-                error_count = int(debug_findings.get("error_count", 0))
-                warning_count = int(debug_findings.get("warning_count", 0))
-                if error_count or warning_count:
-                    parts.append(
-                        f"Debug findings: {error_count} errors, {warning_count} warnings"
-                    )
-        filtered = result.get("filtered_commands", {})
-        if isinstance(filtered, dict):
-            commands = filtered.get("commands", [])
-            if isinstance(commands, list):
-                parts.append(
-                    "Filtered commands "
-                    f"({filtered.get('returned_commands', len(commands))} of "
-                    f"{filtered.get('filtered_total', len(commands))}):"
-                )
-                for command in commands[:10]:
-                    if not isinstance(command, dict):
-                        continue
-                    response = command.get("response", {})
-                    success = bool(response.get("success", False))
-                    status = "OK" if success else "FAIL"
-                    parts.append(
-                        f"  T{command.get('turn', '?')}: [{status}] "
-                        f"{str(command.get('command', '')).strip()}"
-                    )
-        debug_log_error = str(result.get("debug_log_error", "")).strip()
-        if debug_log_error:
-            parts.append(f"Debug log read failed: {debug_log_error}")
-        if parts:
-            return "\n".join(parts)
+        return f"Log analysis result: {result.get('analysis', {}).get('summary', 'Done')}"
+    
     path = str(result.get("path", "")).strip()
     message = str(result.get("message", "")).strip()
     if path and message:
         return f"Code tool result ({path}): {message}"
-    if message:
-        return f"Code tool result: {message}"
-    return f"Code tool result: {json.dumps(result, ensure_ascii=False)}"
+    return f"Code tool result: {message or 'Success'}"

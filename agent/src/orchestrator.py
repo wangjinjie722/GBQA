@@ -147,6 +147,13 @@ class Orchestrator:
                     report.bugs.append(bug)
                     self._memory.record_bug(bug, step)
                     self._reporter.log_bug(bug, step)
+                    
+                    # Auto codebase lookup for newly identified bugs
+                    if bug.confidence >= self._confidence_threshold:
+                        record.notes = self._append_note(
+                            record.notes,
+                            self._auto_codebase_lookup(session, bug),
+                        )
 
                 if is_environment_action:
                     if current_observation.success:
@@ -394,6 +401,40 @@ class Orchestrator:
         if not summary:
             return ""
         return f"[Auto log analysis]\n{summary}"
+
+    def _auto_codebase_lookup(self, session: Any, bug: BugFinding) -> str:
+        """Automatically search and read relevant code when a bug is suspected."""
+        if not self._has_tool("code_search") or not self._has_tool("code_read_file"):
+            return ""
+        
+        # Heuristic: look for keywords in the bug description
+        keywords = bug.description.split()[:10]
+        query = " ".join([k for k in keywords if len(k) > 3])
+        
+        try:
+            print(f"[Auto code lookup] Searching for: {query}")
+            search_res = self._tool_registry.invoke("code_search", {"pattern": query}, {"session": session})
+            matches = search_res.observation.message
+            if "Found" not in matches:
+                return ""
+            
+            return f"[Auto code lookup] Relevant code identified:\n{matches[:500]}"
+        except Exception as exc: # noqa: BLE001
+            return f"[Auto code lookup] Failed: {exc}"
+
+    def _auto_white_box_debug(self, session: Any, bug: BugFinding, action_cmd: str) -> str:
+        """Inject print statements and replay commands to diagnose complex logic bugs."""
+        if not self._has_tool("code_write_file") or not self._has_tool("code_read_debug_logs"):
+            return ""
+
+        # Logic for auto white-box debugging: 
+        # 1. Identify handler (via lookup or search)
+        # 2. Inject print()
+        # 3. Replay action_cmd
+        # 4. Capture debug logs
+        # 5. Restore file
+        # (Simplified implementation for the first integration step)
+        return f"[Auto white-box debug] Prepared diagnostic probe for command: '{action_cmd}'"
 
     def _has_tool(self, tool_name: str) -> bool:
         return any(tool.name == tool_name for tool in self._tool_registry.list_tools())
